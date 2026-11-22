@@ -277,6 +277,30 @@ language state). It runs in about one to a few minutes. The section list and
 the parameters are described in the header of `Collect-DeviceLogs.ps1`; replace
 the file to update the collector.
 
+**Scope of the report on multi-user devices (2.6.10):** the report is cut per
+user. The service reads the token of the pipe client and passes
+`SELFX_CALLER_ADMIN` to the script: `1` only if the local group *Administrators*
+is **enabled** in that token (an elevated administrator), otherwise `0`. A
+missing or any other value (for example an older service) counts as a normal
+user (fail closed).
+
+| | Administrator (`1`) | Normal user (`0` or missing) |
+|---|---|---|
+| Collector | complete | `-UserView -CallerSid <own SID>` |
+| Serial number, console user | yes | no |
+| Sessions (`quser`) | all | own session only |
+| Join state (`dsregcmd`) | everything | join and sign-in state only, no tenant, device or user IDs |
+| Profiles and user hives | all | own profile and own hive |
+| AppX user entries | all | own entry |
+| Names, SIDs and profile folders of other local users in any line | as they are | replaced by `<other user>` |
+| SelfX machine logs (`SelfXService.log`, script logs) | yes | no (they name all users) |
+| Own SelfX user logs | yes | yes |
+
+The collector also runs without `-UserView` (Intune Win32 app, remediation,
+manual run): the report is then complete as before. Note that an administrator
+who runs SelfX **without** elevation is treated as a normal user, because the
+Administrators group is only deny-only in the filtered token.
+
 **SelfX logs in the report (2.6.4):** the wrapper adds the logs of SelfX itself
 (see [Logging](#logging-and-log-housekeeping-selfx-service-260)):
 

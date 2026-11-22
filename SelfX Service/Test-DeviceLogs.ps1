@@ -10,10 +10,12 @@
     Module autoloading is disabled and SystemRoot points to a non-existent folder.
     Run in Windows PowerShell 5.1: powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\Test-DeviceLogs.ps1
 .NOTES
-    Version: 2.6.4
+    Version: 2.6.10
     History:
     2.4.0  2026-11-02  Wolfgang Baeck  Initial device logs tests.
     2.6.4  2026-11-06  Wolfgang Baeck  SelfX logs in the report (selection, own user logs only, no junctions, size limit).
+    2.6.10 2026-11-22  fubu2k          User view: only an elevated administrator (SELFX_CALLER_ADMIN=1) gets the full report;
+                                       normal users get the collector with -UserView and only their own user logs.
 #>
 $ErrorActionPreference = 'Stop'
 Import-Module Microsoft.PowerShell.Utility
@@ -46,8 +48,10 @@ $realStartManualMail = (Get-Command Start-SelfXManualMail).ScriptBlock
 # Mocks, defined after dot-sourcing so that they replace the real functions.
 function Set-ReportAcl { param([string]$Path, [string]$ReaderSid) $script:aclCalls += ,@($Path, $ReaderSid) }
 function Invoke-DeviceLogCollector {
-    param([string]$CollectorPath, [string]$OutputPath, [int]$Days)
+    param([string]$CollectorPath, [string]$OutputPath, [int]$Days, [switch]$UserView, [string]$CallerSid)
     $script:collectorDays = $Days
+    $script:collectorUserView = [bool]$UserView
+    $script:collectorCallerSid = $CallerSid
     if ($script:collectorContent -ne $null) { [IO.File]::WriteAllText($OutputPath, $script:collectorContent) }
     'Collector line 1'
     'Done. Mock report'
@@ -90,6 +94,9 @@ foreach ($name in @('Set-ReportAcl', 'Invoke-DeviceLogCollector', 'Test-SelfXCla
 
 $originalRoot = $env:SystemRoot
 $originalSid = $env:SELFX_CALLER_SID
+$originalAdmin = $env:SELFX_CALLER_ADMIN
+# The existing tests below run as an administrator (full report); the user view has its own tests.
+$env:SELFX_CALLER_ADMIN = '1'
 $env:SystemRoot = 'Z:\SelfX-Nonexistent-Test-Windows'
 $temp = Join-Path ([IO.Path]::GetTempPath()) ('SelfXDeviceLogsTests-' + [guid]::NewGuid().ToString('N'))
 [void][IO.Directory]::CreateDirectory($temp)
@@ -226,7 +233,35 @@ try {
     $text = [IO.File]::ReadAllText(@(Get-ChildItem -LiteralPath $meFolder -Filter '*.txt')[0].FullName)
     Assert-Equal ($text.StartsWith($script:collectorContent) -and $text.Contains('SelfX logs (ProgramData\SelfX\Logs)') -and $text.Contains("----- SelfX-Logs\User\SelfX_2026-11-06.log -----`r`nmy gui log")) $true 'Text report: SelfX logs appended as last section'
     Assert-Equal ($text.Contains('other user') -or $text.Contains('not a log') -or $text.Contains('health old')) $false 'Text report: no logs of other users, no other files, no old logs'
+    Assert-Equal $script:collectorUserView $false 'Administrator: the collector runs without -UserView (full report)'
     Remove-Item -LiteralPath $meFolder -Recurse -Force
+
+    # --- User view for normal users (2.6.10) -----------------------------------------------------
+    # Only SELFX_CALLER_ADMIN=1 (set by the service from the client token) gives the full report; everything else is a normal user.
+    foreach ($value in @('1', '0', '', 'true', 'yes', ' 1', '11')) {
+        $env:SELFX_CALLER_ADMIN = $value
+        Assert-Equal (Test-SelfXCallerIsAdmin) ($value -eq '1') "Caller admin flag '$value'"
+    }
+    Remove-Item Env:\SELFX_CALLER_ADMIN
+    Assert-Equal (Test-SelfXCallerIsAdmin) $false 'Caller admin flag missing (older service): normal user'
+    foreach ($value in @('0', $null)) {
+        if ($null -eq $value) { Remove-Item Env:\SELFX_CALLER_ADMIN -ErrorAction SilentlyContinue } else { $env:SELFX_CALLER_ADMIN = $value }
+        $env:SELFX_CALLER_SID = $me
+        Set-TestConfig 7 True
+        $output = @(Invoke-SelfXCollectLogs -ReportRoot $root -CollectorPath $collector -ConfigPath $config -LogRoot $logRoot)
+        Assert-Equal ($output | Select-Object -Last 1) 0 'User view: report created'
+        Assert-Equal $script:collectorUserView $true 'User view: the collector is started with -UserView'
+        Assert-Equal $script:collectorCallerSid $me 'User view: the collector gets the SID of the caller'
+        Assert-Equal (@($output) -contains 'Report scope: own data of the requesting user') $true 'User view: scope is logged'
+        $zipPath = @(Get-ChildItem -LiteralPath $meFolder -Filter '*.zip')[0].FullName
+        $zip = [IO.Compression.ZipFile]::OpenRead($zipPath)
+        try {
+            $names = @($zip.Entries | ForEach-Object { $_.FullName })
+            Assert-Equal ($names -join ';') ($names | Where-Object { $_ -like '*.txt' } | Select-Object -First 1 | ForEach-Object { "$_;SelfX-Logs\User\SelfX_2026-11-06.log" }) 'User view: zip holds the report and only the own user log, no machine logs'
+        } finally { $zip.Dispose() }
+        Remove-Item -LiteralPath $meFolder -Recurse -Force
+    }
+    $env:SELFX_CALLER_ADMIN = '1'
     $env:SELFX_CALLER_SID = $sid
     Set-TestConfig 7 True
 
@@ -421,6 +456,7 @@ try {
     if ($junction -and (Test-Path -LiteralPath $junction)) { [IO.Directory]::Delete($junction) }
     $env:SystemRoot = $originalRoot
     if ($originalSid) { $env:SELFX_CALLER_SID = $originalSid } else { Remove-Item Env:\SELFX_CALLER_SID -ErrorAction SilentlyContinue }
+    if ($originalAdmin) { $env:SELFX_CALLER_ADMIN = $originalAdmin } else { Remove-Item Env:\SELFX_CALLER_ADMIN -ErrorAction SilentlyContinue }
     Remove-Item -LiteralPath $temp -Recurse -Force -ErrorAction SilentlyContinue
 }
 Write-Output "Device logs tests passed: $script:assertions assertions."

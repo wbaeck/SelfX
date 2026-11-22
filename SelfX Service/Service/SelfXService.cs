@@ -62,6 +62,7 @@ Notes:
     2.5.3    2026-11-04  Wolfgang Baeck       Log uses the current time zone (cache cleared after time zone changes)
     2.5.6    2026-11-05  Wolfgang Baeck       Optional TimeoutSeconds on Health_Config remediations (max. 7200)
     2.6.0    2026-11-06  Wolfgang Baeck       Daily log housekeeping (Log_Retention_Days in Tool_Config.xml, default 90)
+    2.6.10   2026-11-22  fubu2k               RUN children also receive SELFX_CALLER_ADMIN (1 = elevated administrator, from the client token)
 */
 
 using System;
@@ -321,8 +322,9 @@ namespace SelfX
                     string request = ReadLine(reader, MaxRequestLength);
                     try { user = pipe.GetImpersonationUserName(); } catch { }
                     string callerSid = GetCallerSid(pipe);
+                    bool callerIsAdmin = GetCallerIsAdmin(pipe);
 
-                    string response = ProcessRequest(request, user, callerSid);
+                    string response = ProcessRequest(request, user, callerSid, callerIsAdmin);
                     writer.WriteLine(response);
                     try { pipe.WaitForPipeDrain(); } catch { }
                 }
@@ -331,6 +333,33 @@ namespace SelfX
             {
                 Log("Connection error (" + user + "): " + ex.Message);
             }
+        }
+
+        /// <summary>
+        /// True only when the pipe client token has the local Administrators group enabled
+        /// (an elevated administrator). Any error returns false (fail closed: reduced view).
+        /// </summary>
+        static bool GetCallerIsAdmin(NamedPipeServerStream pipe)
+        {
+            bool isAdmin = false;
+            try
+            {
+                pipe.RunAsClient(delegate
+                {
+                    using (WindowsIdentity client = WindowsIdentity.GetCurrent(true))
+                    {
+                        if (client != null)
+                        {
+                            isAdmin = new WindowsPrincipal(client).IsInRole(WindowsBuiltInRole.Administrator);
+                        }
+                    }
+                });
+            }
+            catch
+            {
+                return false;
+            }
+            return isAdmin;
         }
 
         /// <summary>
@@ -385,7 +414,7 @@ namespace SelfX
         /// <summary>
         /// Validate a request and run one approved action, or return a protocol rejection.
         /// </summary>
-        string ProcessRequest(string request, string user, string callerSid)
+        string ProcessRequest(string request, string user, string callerSid, bool callerIsAdmin)
         {
             if (string.IsNullOrEmpty(request))
             {
@@ -468,7 +497,7 @@ namespace SelfX
             }
             try
             {
-                return RunScript(scriptPath, scriptName, timeoutSeconds, user, false, "", callerSid);
+                return RunScript(scriptPath, scriptName, timeoutSeconds, user, false, "", callerSid, false, callerIsAdmin);
             }
             finally
             {
@@ -528,7 +557,7 @@ namespace SelfX
         /// <summary>
         /// Run PowerShell under the service identity and log bounded output and completion.
         /// </summary>
-        string RunScript(string scriptPath, string scriptName, int timeoutSeconds, string user, bool health = false, string healthFilter = "", string callerSid = null, bool background = false)
+        string RunScript(string scriptPath, string scriptName, int timeoutSeconds, string user, bool health = false, string healthFilter = "", string callerSid = null, bool background = false, bool callerIsAdmin = false)
         {
             string powershell = Path.Combine(Environment.SystemDirectory, @"WindowsPowerShell\v1.0\powershell.exe");
             // Health runs also update the status cache; the path contains no quotes.
@@ -547,9 +576,12 @@ namespace SelfX
             startInfo.WorkingDirectory = health ? installRoot : scriptsRoot;
             // Remove any inherited value so only a SID read from the client token reaches the script.
             startInfo.EnvironmentVariables.Remove("SELFX_CALLER_SID");
+            startInfo.EnvironmentVariables.Remove("SELFX_CALLER_ADMIN");
             if (!health && callerSid != null)
             {
                 startInfo.EnvironmentVariables["SELFX_CALLER_SID"] = callerSid;
+                // 1 only for an elevated administrator (read from the client token); scripts treat anything else as a normal user.
+                startInfo.EnvironmentVariables["SELFX_CALLER_ADMIN"] = callerIsAdmin ? "1" : "0";
             }
 
             StringBuilder output = new StringBuilder();

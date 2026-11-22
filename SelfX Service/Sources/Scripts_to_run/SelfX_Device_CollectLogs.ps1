@@ -20,6 +20,11 @@
     folder under Logs\Users, so the script reads there only from a normal folder (no junction) and
     only files the user owns, so no protected file of another account can get into the report.
 
+    Scope (2.6.10): the service also sets SELFX_CALLER_ADMIN (1 = the client token has the local Administrators
+    group enabled, otherwise 0). Only then the report is complete. For every other caller (also when the variable
+    is missing, for example with an older service) the collector runs with -UserView and the machine logs of
+    SelfX (they name all users) are not added; the report contains only the data of the requesting user.
+
     The SID comes from the service (SELFX_CALLER_SID, read from the pipe client token). The
     report folder gets a protected ACL: SYSTEM and administrators full control, the requesting
     user read only; no other user can read the report. Previous reports of that user are
@@ -49,7 +54,7 @@
     Name    : SelfX_Device_CollectLogs.ps1
     Package : SelfX Service
     Context : System
-    Version : 2.6.4
+    Version : 2.6.10
 
     History:
     Version  Date        Author               Change
@@ -59,6 +64,9 @@
                                               in parameter defaults of Windows PowerShell 5.1)
     2.6.0    2026-11-06  Wolfgang Baeck       Logging to ProgramData\SelfX\Logs (SelfXLog.ps1)
     2.6.4    2026-11-06  Wolfgang Baeck       The SelfX logs (service, scripts, own logs of the user) are added to the report
+    2.6.10   2026-11-22  fubu2k               Multi-user: only an elevated administrator (SELFX_CALLER_ADMIN=1) gets the full
+                                              report. Normal users get the collector with -UserView (own session, profile
+                                              and hive; other users hidden) and only their own SelfX user logs.
 #>
 
 [CmdletBinding()]
@@ -111,10 +119,17 @@ function Set-ReportAcl {
 
 # Runs the collector in a separate 64-bit process, which keeps its settings and exit away from this script.
 function Invoke-DeviceLogCollector {
-    param([string]$CollectorPath, [string]$OutputPath, [int]$Days)
+    param([string]$CollectorPath, [string]$OutputPath, [int]$Days, [switch]$UserView, [string]$CallerSid)
     $powershell = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
-    return @(& $powershell -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $CollectorPath -OutputPath $OutputPath -Days $Days 2>&1)
+    $arguments = @('-NoLogo', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', $CollectorPath, '-OutputPath', $OutputPath, '-Days', $Days)
+    # Normal users get the reduced report of their own data only (2.6.10).
+    if ($UserView) { $arguments += @('-UserView', '-CallerSid', $CallerSid) }
+    return @(& $powershell @arguments 2>&1)
 }
+
+# Only an elevated administrator (SELFX_CALLER_ADMIN=1, set by the service from the pipe client token) gets the full
+# report. Missing or any other value (older service, unknown caller) means normal user: the reduced report.
+function Test-SelfXCallerIsAdmin { return ("$env:SELFX_CALLER_ADMIN" -eq '1') }
 
 # SelfX logs for the report: the logs of the SelfX service and scripts (ProgramData\SelfX\Logs, written by SYSTEM)
 # and the own logs of the requesting user (Logs\Users\<caller SID>). Logs of other users are never added.
@@ -213,7 +228,9 @@ function Invoke-SelfXCollectLogs {
         $baseName = 'DeviceLogs-{0}-{1}' -f $env:COMPUTERNAME, (Get-Date -Format 'yyyyMMdd-HHmmss')
         $textFile = Join-Path $userFolder "$baseName.txt"
 
-        $collectorOutput = @(Invoke-DeviceLogCollector -CollectorPath $CollectorPath -OutputPath $textFile -Days $days)
+        $userView = -not (Test-SelfXCallerIsAdmin)
+        Write-Output ('Report scope: {0}' -f $(if ($userView) { 'own data of the requesting user' } else { 'administrator (full report)' }))
+        $collectorOutput = @(Invoke-DeviceLogCollector -CollectorPath $CollectorPath -OutputPath $textFile -Days $days -UserView:$userView -CallerSid $callerSid)
         # Only the summary (findings and the final line) goes to the bounded service log.
         $collectorOutput | Select-Object -Last 15 | ForEach-Object { Write-Output "$_" }
 
@@ -225,6 +242,8 @@ function Invoke-SelfXCollectLogs {
         # SelfX logs (service, scripts, the own logs of the user); a problem here never fails the report.
         $ownLogs = @()
         try { $ownLogs = @(Get-SelfXOwnLogFiles -LogRoot $LogRoot -CallerSid $callerSid -Days $days) } catch { Write-Output "SelfX logs not added: $($_.Exception.Message)" }
+        # Machine logs (service and script logs) name all users; only administrators get them.
+        if ($userView) { $ownLogs = @($ownLogs | Where-Object { $_.Entry -like 'SelfX-Logs\User\*' }) }
         $logTotal = 0L
         $logLimit = 30MB
         if ($compress) {

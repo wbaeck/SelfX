@@ -85,6 +85,10 @@
                                        relevant for an analysis, not only the language deployment); report DeviceLogs-<PC>-<time>.txt
     1.2.1    Wolfgang Baeck (Swisscom) As SYSTEM without -OutputPath the report is C:\Windows\Temp\<PC>-DeviceLogs.log, so the
                                        script runs unchanged as Win32 app and as on-demand remediation script
+    1.3.0    fubu2k                    -UserView -CallerSid <SID>: report for a normal user on a multi-user device. Only the own
+                                       session, profile and user hive; no serial number or console user; join state without tenant
+                                       and device IDs; names, SIDs and profile folders of other local users are replaced by
+                                       <other user>. Without -UserView nothing changes.
 #>
 
 [CmdletBinding()]
@@ -92,7 +96,11 @@ param(
     [ValidateRange(1, 60)][int]$Days = 7,
     [ValidateRange(100, 20000)][int]$MaxLinesPerLog = 2500,
     [switch]$Deep,
-    [string]$OutputPath
+    [string]$OutputPath,
+    # User view (1.3.0): report for a normal user. Set by SelfX_Device_CollectLogs.ps1 (SelfX Service) for callers who
+    # are not elevated administrators. Without -UserView the report is complete (Intune, administrators).
+    [switch]$UserView,
+    [string]$CallerSid
 )
 
 # Intune starts a 32-bit PowerShell; it would read the redirected registry and System32. Relaunch in 64-bit.
@@ -110,7 +118,10 @@ if ([Environment]::Is64BitOperatingSystem -and -not [Environment]::Is64BitProces
     }
 }
 
-$ScriptVersion = '1.2.1'
+$ScriptVersion = '1.3.0'
+if ($UserView) {
+    try { $null = [Security.Principal.SecurityIdentifier]::new("$CallerSid") } catch { Write-Error 'The user view needs a valid -CallerSid.'; exit 2 }
+}
 $ErrorActionPreference = 'Continue'
 $ProgressPreference = 'SilentlyContinue'
 $startedAt = Get-Date
@@ -133,7 +144,42 @@ else {
 $writer = New-Object System.IO.StreamWriter($outFile, $false, (New-Object System.Text.UTF8Encoding($true)))
 $script:Problems = New-Object System.Collections.Generic.List[string]
 
-function Add-Line { param([string]$Text) $writer.WriteLine($Text) }
+# User view: names, SIDs and profile folders of the other local users never reach the report.
+$script:OtherUserPattern = $null
+$script:CallerName = ''
+function Initialize-UserView {
+    param([string]$Sid)
+    $caller = ([Security.Principal.SecurityIdentifier]::new($Sid)).Value
+    $script:CallerSid = $caller
+    try { $script:CallerName = ([Security.Principal.SecurityIdentifier]::new($caller)).Translate([Security.Principal.NTAccount]).Value } catch { $script:CallerName = '' }
+    $tokens = New-Object System.Collections.Generic.HashSet[string] ([StringComparer]::OrdinalIgnoreCase)
+    $ownLeaf = ''
+    foreach ($key in @(Get-ChildItem -LiteralPath 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList' -ErrorAction SilentlyContinue)) {
+        $sid = [string]$key.PSChildName
+        if ($sid -notmatch '^S-1-(5-21|12-1)-[\d-]+$') { continue }
+        $path = [string](Get-ItemProperty -LiteralPath $key.PSPath -ErrorAction SilentlyContinue).ProfileImagePath
+        $leaf = if ($path) { Split-Path -Leaf $path } else { '' }
+        if ($sid -eq $caller) { $ownLeaf = $leaf; continue }
+        [void]$tokens.Add($sid)
+        if ($leaf) { [void]$tokens.Add($leaf) }
+        try {
+            $account = ([Security.Principal.SecurityIdentifier]::new($sid)).Translate([Security.Principal.NTAccount]).Value
+            [void]$tokens.Add($account)
+            [void]$tokens.Add(($account -split '\\')[-1])
+        } catch { }
+    }
+    # Never hide the own names (the same word can be the own account and another profile folder).
+    foreach ($own in @($ownLeaf, $script:CallerName, (($script:CallerName -split '\\')[-1]))) { if ($own) { [void]$tokens.Remove($own) } }
+    $parts = @($tokens | Where-Object { $_ -and $_.Length -ge 2 } | Sort-Object Length -Descending | ForEach-Object { [regex]::Escape($_) })
+    if ($parts.Count) { $script:OtherUserPattern = [regex]::new('(?<![\w-])(' + ($parts -join '|') + ')(?![\w-])', 'IgnoreCase') }
+}
+function Hide-OtherUsers {
+    param([string]$Text)
+    if ($script:OtherUserPattern -and $Text) { return $script:OtherUserPattern.Replace($Text, '<other user>') }
+    return $Text
+}
+function Add-Line { param([string]$Text) $writer.WriteLine((Hide-OtherUsers $Text)) }
+if ($UserView) { Initialize-UserView -Sid $CallerSid }
 function Add-Section {
     param([string]$Title)
     Add-Line ''
@@ -328,7 +374,8 @@ Invoke-Safe 'OS' {
 Invoke-Safe 'Computer' {
     $cs = Get-CimInstance -ClassName Win32_ComputerSystem -ErrorAction Stop
     $bios = Get-CimInstance -ClassName Win32_BIOS -ErrorAction SilentlyContinue
-    "Hardware         : $($cs.Manufacturer) $($cs.Model); serial $($bios.SerialNumber); console user '$($cs.UserName)'; domain/workgroup '$($cs.Domain)'"
+    if ($UserView) { "Hardware         : $($cs.Manufacturer) $($cs.Model); domain/workgroup '$($cs.Domain)' (user view: no serial number, no console user)" }
+    else { "Hardware         : $($cs.Manufacturer) $($cs.Model); serial $($bios.SerialNumber); console user '$($cs.UserName)'; domain/workgroup '$($cs.Domain)'" }
 }
 Invoke-Safe 'Disk' {
     $types = @{ 0 = 'unknown'; 1 = 'no root'; 2 = 'removable'; 3 = 'local'; 4 = 'network'; 5 = 'CD/DVD/ISO'; 6 = 'RAM disk' }
@@ -347,15 +394,29 @@ Invoke-Safe 'Disk' {
 Invoke-Safe 'Time zone' { "Time zone        : $((Get-TimeZone).Id)" }
 Invoke-Safe 'Sessions' {
     'Sessions (query user / quser):'
-    @(& "$env:SystemRoot\System32\quser.exe" 2>&1) | ForEach-Object { "    $_" }
+    $sessionLines = @(& "$env:SystemRoot\System32\quser.exe" 2>&1)
+    if ($UserView) {
+        # Only the header and the sessions of the requesting user (first column = user name).
+        $ownShort = ($script:CallerName -split '\\')[-1]
+        $sessionLines = @($sessionLines | Select-Object -First 1) + @($sessionLines | Select-Object -Skip 1 | Where-Object { $ownShort -and (($_ -replace '^[>\s]+', '') -split '\s+')[0] -ieq $ownShort })
+        '    (user view: sessions of other users are not listed)'
+    }
+    $sessionLines | ForEach-Object { "    $_" }
 }
 Invoke-Safe 'dsregcmd' {
     'dsregcmd /status (join state, tenant, MDM):'
-    @(& "$env:SystemRoot\System32\dsregcmd.exe" /status 2>&1) | Where-Object { $_ -match ':' } | ForEach-Object { "    $_" } | Select-Object -First 120
+    $dsreg = @(& "$env:SystemRoot\System32\dsregcmd.exe" /status 2>&1) | Where-Object { $_ -match ':' }
+    if ($UserView) {
+        # Join state only; tenant, device and user identifiers are for administrators.
+        '    (user view: only the join and sign-in state, no tenant, device or user identifiers)'
+        $dsreg = @($dsreg | Where-Object { $_ -match '^\s*(AzureAdJoined|EnterpriseJoined|DomainJoined|DeviceAuthStatus|NgcSet|AzureAdPrt|WamDefaultSet|WorkplaceJoined)\s*:' })
+    }
+    $dsreg | ForEach-Object { "    $_" } | Select-Object -First 120
 }
 Invoke-Safe 'Loaded profiles' {
     'ProfileList:'
     foreach ($key in @(Get-ChildItem -LiteralPath 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList' -ErrorAction SilentlyContinue)) {
+        if ($UserView -and $key.PSChildName -match '^S-1-(5-21|12-1)-[\d-]+$' -and $key.PSChildName -ne $script:CallerSid) { continue }
         $path = [string](Get-ItemProperty -LiteralPath $key.PSPath -ErrorAction SilentlyContinue).ProfileImagePath
         $created = ''
         if ($path -and (Test-Path -LiteralPath $path -ErrorAction SilentlyContinue)) { $created = (Get-Item -LiteralPath $path -Force -ErrorAction SilentlyContinue).CreationTime.ToString('yyyy-MM-dd HH:mm:ss') }
@@ -566,7 +627,7 @@ Invoke-Safe 'HKCU' {
     Get-RegistryValues -Path 'HKCU:\Software\Swisscom\LanguageDeployment'
 }
 Invoke-Safe 'Loaded user hives' {
-    foreach ($key in @(Get-ChildItem -LiteralPath 'Registry::HKEY_USERS' -ErrorAction SilentlyContinue | Where-Object { $_.PSChildName -match '^S-1-(5-21|12-1)-[\d-]+$' })) {
+    foreach ($key in @(Get-ChildItem -LiteralPath 'Registry::HKEY_USERS' -ErrorAction SilentlyContinue | Where-Object { $_.PSChildName -match '^S-1-(5-21|12-1)-[\d-]+$' -and (-not $UserView -or $_.PSChildName -eq $script:CallerSid) })) {
         "Loaded user hive $($key.PSChildName):"
         Get-ProfileSettings -Root "Registry::HKEY_USERS\$($key.PSChildName)"
     }
@@ -917,7 +978,7 @@ Invoke-Safe 'Teams packages' {
     if (-not $packages.Count) { "    MSTeams is not installed for $scope." }
     foreach ($package in $packages) {
         '    {0} {1} ({2}); status {3}; location {4}' -f $package.Name, $package.Version, $package.Architecture, $package.Status, $package.InstallLocation
-        foreach ($user in @($package.PackageUserInformation)) { "        user $($user.UserSecurityId.Username) ($($user.UserSecurityId.Sid)): $($user.InstallState)" }
+        foreach ($user in @($package.PackageUserInformation | Where-Object { -not $UserView -or $_.UserSecurityId.Sid -eq $script:CallerSid })) { "        user $($user.UserSecurityId.Username) ($($user.UserSecurityId.Sid)): $($user.InstallState)" }
     }
     'Provisioned for new users (AppxAllUserStore, registry):'
     $provisioned = @(Get-ChildItem -LiteralPath 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Appx\AppxAllUserStore\Applications' -ErrorAction SilentlyContinue | Where-Object { $_.PSChildName -match 'Teams' })
